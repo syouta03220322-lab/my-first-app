@@ -1,0 +1,102 @@
+name: Build LastTrainUnarrived Windows EXE
+
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - "LastTrainUnarrived/**"
+
+permissions:
+  contents: read
+
+jobs:
+  build-windows:
+    runs-on: windows-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+
+      - name: Confirm the actual game source is committed
+        shell: pwsh
+        run: |
+          $src = Join-Path $env:GITHUB_WORKSPACE "LastTrainUnarrived"
+          if (-not (Test-Path (Join-Path $src "index.html"))) {
+            Write-Host "::error::LastTrainUnarrived/index.html is not committed to GitHub. The Codespaces working tree may be uncommitted. Commit the actual game source before building."
+            exit 1
+          }
+          Write-Host "Game source found:"
+          Get-ChildItem $src -File | Select-Object -First 30 Name,Length | Format-Table
+
+      - name: Stage game without changing original sources
+        shell: pwsh
+        run: |
+          $src = Join-Path $env:GITHUB_WORKSPACE "LastTrainUnarrived"
+          $stage = Join-Path $env:RUNNER_TEMP "LastTrainApp"
+          New-Item -ItemType Directory -Force -Path $stage | Out-Null
+          Get-ChildItem -LiteralPath $src -Force |
+            Where-Object { $_.Name -notin @("node_modules", ".git", "dist") } |
+            ForEach-Object { Copy-Item -LiteralPath $_.FullName -Destination $stage -Recurse -Force }
+          if (-not (Test-Path (Join-Path $stage "package.json"))) {
+            $pkg = @{name="last-train-unarrived";version="2.2.0";private=$true;main="electron-main.cjs"} | ConvertTo-Json
+            Set-Content -LiteralPath (Join-Path $stage "package.json") -Value $pkg -Encoding UTF8
+          }
+          $pkg = Get-Content -LiteralPath (Join-Path $stage "package.json") -Raw | ConvertFrom-Json
+          if (-not $pkg.main -or -not (Test-Path (Join-Path $stage $pkg.main))) {
+            $main = @'
+          const { app, BrowserWindow, Menu } = require("electron");
+          function createWindow() {
+            const win = new BrowserWindow({
+              width: 1920, height: 1080, minWidth: 960, minHeight: 540,
+              backgroundColor: "#080a0e", autoHideMenuBar: true,
+              webPreferences: { nodeIntegration: false, contextIsolation: true, sandbox: true }
+            });
+            win.loadFile("index.html");
+          }
+          app.whenReady().then(() => {
+            createWindow();
+            app.on("activate", () => { if (BrowserWindow.getAllWindows().length === 0) createWindow(); });
+          });
+          app.on("window-all-closed", () => { if (process.platform !== "darwin") app.quit(); });
+          '@
+            Set-Content -LiteralPath (Join-Path $stage "electron-main.cjs") -Value $main -Encoding UTF8
+            $pkg | Add-Member -NotePropertyName main -NotePropertyValue "electron-main.cjs" -Force
+            $pkg | ConvertTo-Json -Depth 16 | Set-Content -LiteralPath (Join-Path $stage "package.json") -Encoding UTF8
+          }
+          if (Test-Path (Join-Path $stage "package-lock.json")) {
+            Push-Location $stage
+            npm ci --omit=dev --ignore-scripts
+            if ($LASTEXITCODE -ne 0) { throw "npm ci failed" }
+            Pop-Location
+          }
+          "STAGING=$stage" >> $env:GITHUB_ENV
+
+      - name: Package portable Windows EXE
+        shell: pwsh
+        run: |
+          npx --yes --package=@electron/packager@18.3.6 -- electron-packager "$env:STAGING" LastTrainUnarrived --platform=win32 --arch=x64 --out=dist --overwrite --prune=false --electron-version=35.7.5
+          if ($LASTEXITCODE -ne 0) { throw "electron-packager failed" }
+          $exe = Get-ChildItem -Path "dist" -Filter "LastTrainUnarrived.exe" -Recurse | Select-Object -First 1
+          if (-not $exe) { throw "No Windows executable found" }
+          Write-Host "Built: $($exe.FullName)"
+          $dir = $exe.Directory.FullName
+          $zip = Join-Path $env:GITHUB_WORKSPACE "LastTrainUnarrived-Windows-x64.zip"
+          Compress-Archive -Path "$dir\*" -DestinationPath $zip -Force -CompressionLevel Optimal
+          if (-not (Test-Path $zip)) { throw "Missing packaged ZIP" }
+          Write-Host "ZIP size (bytes): $((Get-Item $zip).Length)"
+          $hash = (Get-FileHash -LiteralPath $zip -Algorithm SHA256).Hash
+          "SHA256 $hash" | Set-Content -LiteralPath "BUILD_HASH.txt" -Encoding UTF8
+
+      - name: Upload ZIP and hash (one downloadable artifact)
+        uses: actions/upload-artifact@v4
+        with:
+          name: LastTrainUnarrived-Windows-x64
+          path: |
+            LastTrainUnarrived-Windows-x64.zip
+            BUILD_HASH.txt
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 14
